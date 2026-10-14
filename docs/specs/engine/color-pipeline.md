@@ -106,7 +106,9 @@ schema 8). At runtime:
   time of day, `sky.rs`) decoded from 8-bit sRGB to linear, as light colours are.
 - When the model is instantiated below the reference, each marked surface draws with a material
   whose emission is the model's own emission times that colour. Materials are shared per model
-  material and colour, and the model's material stays unchanged for other references.
+  material and colour, and the model's material stays unchanged for other references. The cache
+  of shared materials holds ids, not handles, so a material is freed with the last surface that
+  draws with it when its cell unloads.
 
 Approximations: the colour multiplies the published emission instead of replacing the NIF tint,
 because the glTF cannot separate tint from multiplier; the two agree for the white-tinted window

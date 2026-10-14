@@ -470,8 +470,8 @@ Inn's reference in Riverwood (`0002D763`) names `FXLightRegionInvertWindowWhiter
 whose one weather `FXWthrInvertWindowsWhiterun` (`0008277A`) has a black Effect Lighting colour by
 day and an amber one at night (#242).
 
-The complete load-order export writes one row per distinct `XEMI` target it can resolve, as 8-bit
-sRGB at sunrise, day, sunset and night:
+The complete load-order export rebuilds the table, writing one row per distinct `XEMI` target it can
+resolve, as 8-bit sRGB at sunrise, day, sunset and night:
 
 - `LIGH`: the `DATA` colour (bytes 8-10), the same at every time of day.
 - `REGN`: the `RDWT` weather with the highest chance (the first on a tie), and that weather's

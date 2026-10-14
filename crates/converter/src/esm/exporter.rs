@@ -230,10 +230,31 @@ pub fn create_tables(conn: &Connection) -> Result<()> {
              plugin_path TEXT PRIMARY KEY, file_hash BLOB NOT NULL, last_converted INTEGER NOT NULL
          );"#
     )?;
+    // `CREATE TABLE IF NOT EXISTS` leaves a reused older table as it was; give it the columns
+    // later schemas added, so a complete export can still insert into it.
+    add_missing_columns(conn, "references", &[("emittance_id", "INTEGER")])?;
     conn.execute(
         "INSERT INTO schema_info(version) SELECT ?1 WHERE NOT EXISTS (SELECT 1 FROM schema_info)",
         [shared::WORLD_DATABASE_SCHEMA_VERSION],
     )?;
+    Ok(())
+}
+
+/// Adds each `(name, declaration)` column `table` lacks.
+fn add_missing_columns(conn: &Connection, table: &str, columns: &[(&str, &str)]) -> Result<()> {
+    for (name, declaration) in columns {
+        let present: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name=?2)",
+            [table, name],
+            |row| row.get(0),
+        )?;
+        if !present {
+            conn.execute(
+                &format!("ALTER TABLE \"{table}\" ADD COLUMN {name} {declaration}"),
+                [],
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -525,13 +546,15 @@ fn export_records(
     tx.commit()
 }
 
-/// One `emittance` row per `XEMI` target in `references` that resolves to a colour.
+/// Rebuilds `emittance`: one row per `XEMI` target in `references` that resolves to a colour.
 ///
 /// A light lends its `DATA` colour at every hour; a region lends its likeliest weather's Effect
 /// Lighting colour at each time of day (see [`crate::esm::emittance`]). A target that is missing
 /// or does not resolve gets no row, so the runtime keeps the model's own emission for its
-/// references.
+/// references. Rows from an earlier export into the same database are dropped first, so a target
+/// that no longer resolves loses its old colour.
 fn insert_emittance_sources(tx: &Transaction<'_>, master: &HashMap<u32, RawRecord>) -> Result<()> {
+    tx.execute("DELETE FROM emittance", [])?;
     let targets: Vec<u32> = tx
         .prepare("SELECT DISTINCT emittance_id FROM \"references\" WHERE emittance_id IS NOT NULL")?
         .query_map([], |row| row.get(0))?
@@ -1665,6 +1688,68 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM emittance", [], |row| row.get(0))
             .unwrap();
         assert_eq!(rows, 2);
+    }
+
+    /// A second export into the same database drops the colour of a target that no longer
+    /// resolves, instead of keeping the first export's row.
+    #[test]
+    fn re_exporting_drops_emittance_that_no_longer_resolves() {
+        let conn = Connection::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let mut master = HashMap::new();
+        for record in [
+            emitting_reference(0x1000, 0x8277B),
+            region(0x8277B, &[(0x8277A, 100)]),
+            weather(0x8277A, [[0; 3]; 4]),
+        ] {
+            master.insert(record.form_id, record);
+        }
+        export_with_emittance(&conn, &master);
+        assert!(emittance_row(&conn, 0x8277B).is_some());
+
+        master.remove(&0x8277A);
+        export_with_emittance(&conn, &master);
+        assert_eq!(emittance_row(&conn, 0x8277B), None);
+    }
+
+    /// A `references` table from world database schema 7 has no `emittance_id`; `create_tables`
+    /// adds it, so a complete export into a reused database still inserts its references.
+    #[test]
+    fn create_tables_adds_emittance_id_to_a_schema_7_references_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE "references" (
+                id INTEGER PRIMARY KEY, cell_id INTEGER NOT NULL, worldspace_id INTEGER,
+                base_form_id INTEGER NOT NULL, is_exterior INTEGER NOT NULL,
+                pos_x REAL NOT NULL, pos_y REAL NOT NULL, pos_z REAL NOT NULL,
+                local_x REAL, local_y REAL, rot_x REAL NOT NULL, rot_y REAL NOT NULL,
+                rot_z REAL NOT NULL, scale REAL NOT NULL DEFAULT 1.0,
+                radius_override REAL, header_flags INTEGER NOT NULL DEFAULT 0,
+                enable_parent_id INTEGER, enable_parent_flags INTEGER, data BLOB
+            );"#,
+        )
+        .unwrap();
+        create_tables(&conn).unwrap();
+        // A second call finds the column and leaves the table alone.
+        create_tables(&conn).unwrap();
+        let mut master = HashMap::new();
+        for record in [
+            emitting_reference(0x1000, 0x8277B),
+            region(0x8277B, &[(0x8277A, 100)]),
+            weather(0x8277A, [[0; 3]; 4]),
+        ] {
+            master.insert(record.form_id, record);
+        }
+        export_with_emittance(&conn, &master);
+        let emittance_id: Option<u32> = conn
+            .query_row(
+                "SELECT emittance_id FROM \"references\" WHERE id=0x1000",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(emittance_id, Some(0x8277B));
+        assert!(emittance_row(&conn, 0x8277B).is_some());
     }
 
     /// The Sleeping Giant Inn's reference in Riverwood names `FXLightRegionInvertWindowWhiterun`,

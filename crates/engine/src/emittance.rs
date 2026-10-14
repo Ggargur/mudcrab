@@ -19,10 +19,12 @@ pub struct EmittancePlugin;
 
 impl Plugin for EmittancePlugin {
     fn build(&self, app: &mut App) {
-        app.init_resource::<EmittanceMaterials>().add_systems(
-            SpawnScene,
-            apply_reference_emittance.after(SceneSpawnerSystems::WorldInstanceSpawn),
-        );
+        app.init_resource::<EmittanceMaterials>()
+            .add_systems(
+                SpawnScene,
+                apply_reference_emittance.after(SceneSpawnerSystems::WorldInstanceSpawn),
+            )
+            .add_systems(Update, forget_freed_materials);
     }
 }
 
@@ -43,9 +45,13 @@ impl ReferenceEmittance {
 struct EmittanceSourceMaterial(Handle<StandardMaterial>);
 
 /// One material per model material and emittance colour, shared by every reference that lends the
-/// same colour, so emitting references keep batching together.
+/// same colour, so emitting references keep batching together. The cache holds ids, not handles:
+/// a derived material is freed with the last surface that draws with it, as a cell unloads, and
+/// [`forget_freed_materials`] then drops its entry.
 #[derive(Resource, Default)]
-struct EmittanceMaterials(HashMap<(AssetId<StandardMaterial>, [u32; 3]), Handle<StandardMaterial>>);
+struct EmittanceMaterials(
+    HashMap<(AssetId<StandardMaterial>, [u32; 3]), AssetId<StandardMaterial>>,
+);
 
 /// `material` with its emission multiplied by `colour`. The published emission is the NIF's tint
 /// times its multiplier (`docs/specs/engine/color-pipeline.md`), which the glTF cannot separate, so
@@ -106,14 +112,18 @@ fn apply_reference_emittance(
                 }
             };
             let key = (source.id(), colour_key);
-            let lit = match cache.0.get(&key) {
-                Some(lit) => lit.clone(),
+            let cached = cache
+                .0
+                .get(&key)
+                .and_then(|&lit| materials.get_strong_handle(lit));
+            let lit = match cached {
+                Some(lit) => lit,
                 None => {
                     let Some(lit) = materials.get(&source).map(|base| lit_by(base, colour)) else {
                         continue;
                     };
                     let lit = materials.add(lit);
-                    cache.0.insert(key, lit.clone());
+                    cache.0.insert(key, lit.id());
                     lit
                 }
             };
@@ -124,15 +134,33 @@ fn apply_reference_emittance(
     }
 }
 
+/// Drops the cache entries of materials Bevy has freed: a derived material whose last surface
+/// unloaded, or a model material whose model did.
+fn forget_freed_materials(
+    mut events: MessageReader<AssetEvent<StandardMaterial>>,
+    mut cache: ResMut<EmittanceMaterials>,
+) {
+    for event in events.read() {
+        if let AssetEvent::Removed { id } = event {
+            cache.0.retain(|(source, _), lit| source != id && lit != id);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Asset tracking runs, so a material whose last handle drops is freed as in the engine.
     fn app() -> App {
         let mut app = App::new();
-        app.init_resource::<Assets<StandardMaterial>>()
+        app.add_plugins((MinimalPlugins, AssetPlugin::default()))
+            .init_asset::<StandardMaterial>()
             .init_resource::<EmittanceMaterials>()
-            .add_systems(Update, apply_reference_emittance);
+            .add_systems(
+                Update,
+                (apply_reference_emittance, forget_freed_materials).chain(),
+            );
         app
     }
 
@@ -238,6 +266,43 @@ mod tests {
         assert_eq!(handle(first), handle(second));
         assert_ne!(handle(first), handle(other));
         assert_ne!(handle(first), material);
+    }
+
+    /// A cell unloading despawns its references. The material derived for their surfaces is freed
+    /// with them instead of staying in the cache, and a reference loaded later gets a new one.
+    #[test]
+    fn a_derived_material_is_freed_with_its_last_surface() {
+        let mut app = app();
+        let material = glowing(&mut app, LinearRgba::new(3.0, 3.0, 3.0, 1.0));
+        let colour = Color::srgb_u8(242, 176, 55).to_linear();
+        let lit = LinearRgba::new(3.0 * colour.red, 3.0 * colour.green, 3.0 * colour.blue, 1.0);
+        let (placed, window, _) = reference(&mut app, Some([242, 176, 55]), &material);
+        app.update();
+        let derived = app
+            .world()
+            .get::<MeshMaterial3d<StandardMaterial>>(window)
+            .unwrap()
+            .0
+            .id();
+
+        app.world_mut().entity_mut(placed).despawn();
+        for _ in 0..3 {
+            app.update();
+        }
+        assert!(
+            !app.world()
+                .resource::<Assets<StandardMaterial>>()
+                .contains(derived),
+            "the derived material is freed"
+        );
+        assert!(
+            app.world().resource::<EmittanceMaterials>().0.is_empty(),
+            "and the cache forgets it"
+        );
+
+        let (_, window, _) = reference(&mut app, Some([242, 176, 55]), &material);
+        app.update();
+        assert_eq!(emissive(&app, window), lit);
     }
 
     #[test]

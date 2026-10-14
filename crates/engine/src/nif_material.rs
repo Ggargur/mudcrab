@@ -43,6 +43,8 @@ const SLSF1_EXTERNAL_EMITTANCE: u64 = 1 << 29;
 #[reflect(Component, Default)]
 pub struct ExternalEmittance;
 
+/// Whether the converter published `SLSF1_External_Emittance` in the material's
+/// `extras.openSkyrim.shaderFlags1`.
 fn has_external_emittance(material: &gltf::Material<'_>) -> bool {
     material
         .extras()
