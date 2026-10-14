@@ -97,7 +97,7 @@ amber at night. Publishing the static emission alone left the windows lit in day
 
 The GLB keeps the flag in `extras.openSkyrim.shaderFlags1`, so no mesh is reconverted. The
 converter resolves each `XEMI` source's colour at every time of day into the `emittance` table
-([db-schema §15](../converters/db-schema.md#15-reference-emittance-sources-emittance), world
+([db-schema §16](../converters/db-schema.md#16-reference-emittance-sources-emittance), world
 schema 8). At runtime:
 
 - `NifMaterialPlugin` marks each primitive whose material has bit 29 with `ExternalEmittance`,
