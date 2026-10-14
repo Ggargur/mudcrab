@@ -8,12 +8,13 @@ This specification details the canonical DDL schema, tables, indices, and column
 
 `skyrim_world.db` is built by `crates/converter` by parsing master files (`Skyrim.esm`) and plugin files (`.esp`/`.esl`). When `PipelineConfig.plugins_file` is supplied, ESM-flagged plugins and `.esm`/`.esl` files take priority, keeping the listed order within each category except that regular dependencies are moved ahead of the master files that need them. The resulting order is validated before assigning full/light slots, ordering archive (BSA/BA2) priority, and merging database records and terrain caches. Unrelated regular plugins retain the user's order. This is not a general dependency sort: any inversions remaining after normalization, including a master file listed before another master it depends on, are rejected. The CLI and launcher currently use automatic discovery: only plugins directly in Data are selected, with dependencies ordered before dependents. Among available plugins, ESM-flagged plugins and `.esm`/`.esl` files take priority, followed by the five official files' conventional order and case-insensitive filename order. The ESL header flag alone assigns a light slot; an ESL-flagged `.esp` stays among regular plugins. Missing masters and dependency cycles fail with diagnostics. This deterministic fallback cannot infer a user's intended override order between unrelated mods; nested backup/optional plugins are ignored while nested assets remain discoverable.
 
-The database stamps its version in `schema_info`; the current version is **7**
+The database stamps its version in `schema_info`; the current version is **8**
 (`shared::WORLD_DATABASE_SCHEMA_VERSION`). Schema 4 added lights and
 `references.radius_override`. Schema 5 adds grass data in #152;
 the combined producer exports grass and LOD tables. Schema 6 adds LOD origins, chunk metadata,
-its spatial index, and a build identity. The engine, `world-inspect` and
-launcher accept world schemas **3 through 7**, using
+its spatial index, and a build identity. Schema 8 adds `references.emittance_id` and the
+`emittance` table (#242). The engine, `world-inspect` and
+launcher accept world schemas **3 through 8**, using
 `shared::supports_runtime_world_database_schema`. Complete converter packages
 support schemas **15 through 24**. Legacy worlds render full detail without
 LOD; an advertised LOD package requires the current database contract.
@@ -129,6 +130,7 @@ CREATE TABLE IF NOT EXISTS references (
     header_flags INTEGER NOT NULL DEFAULT 0, -- Winning record header flags, uninterpreted
     enable_parent_id INTEGER,           -- Remapped XESP parent FormID; NULL when absent
     enable_parent_flags INTEGER,        -- XESP flags; NULL when absent
+    emittance_id INTEGER,               -- Remapped XEMI light or region FormID; NULL when absent
     data BLOB                           -- Subrecords payload
 );
 
@@ -144,6 +146,9 @@ subrecord, with the parent FormID resolved through plugin load order. The raw
 subrecord payload remains in `data`. An invalid parent link is published as
 `enable_parent_id = 0` (no parent) with its flags kept; a malformed `XESP` is
 dropped, so both columns are NULL. See the remapped-field table below.
+
+`emittance_id` is the reference's `XEMI`: the light or region whose colour the
+`External_Emittance` surfaces of its model take (§15). A cleared link is stored as NULL.
 
 ---
 
@@ -269,6 +274,7 @@ reference and cell fields, validated against their expected sizes:
 | `XCIM`, `XCMO`, `XCAS` | CELL | image space, music type, acoustic space |
 | `XCCM` | CELL | region the cell takes its sky and weather from |
 | `XCLR` | CELL | regions (array) |
+| `RDWT` | REGN | each 12-byte entry's weather (bytes 0-3) and global (bytes 8-11); the chance is kept |
 
 For blob remapping, placed references are REFR, ACHR, ACRE, PGRE, PMIS, PHZD,
 PARW, PBAR, PBEA, PCON and PFLA. This does not expand the record types exported
@@ -452,3 +458,52 @@ grass definitions. The subset export used by movement annotation preserves unrel
 grass rows; if it includes an LTEX, only that texture's association list is replaced.
 Movement annotation continues to accept schema 4 through the current schema and
 preserves the existing database version; it does not perform a full reconversion.
+
+---
+
+### 15. Reference Emittance Sources (`emittance`)
+
+A NIF shader with `SLSF1_External_Emittance` (bit 29) takes its emission colour from outside the
+model: from the light or region the placing reference names in `XEMI`
+(`references.emittance_id`). Skyrim keeps building windows dark by day this way. The Sleeping Giant
+Inn's reference in Riverwood (`0002D763`) names `FXLightRegionInvertWindowWhiterun` (`0008277B`),
+whose one weather `FXWthrInvertWindowsWhiterun` (`0008277A`) has a black Effect Lighting colour by
+day and an amber one at night (#242).
+
+The complete load-order export writes one row per distinct `XEMI` target it can resolve, as 8-bit
+sRGB at sunrise, day, sunset and night:
+
+- `LIGH`: the `DATA` colour (bytes 8-10), the same at every time of day.
+- `REGN`: the `RDWT` weather with the highest chance (the first on a tie), and that weather's
+  `NAM0` Effect Lighting colour, the tenth colour type. `NAM0` holds 16 bytes per colour type
+  (sunrise, day, sunset and night, each RGB and an unused byte); the official plugins store 13,
+  14 or 17 types. A region changes weather with its climate, which the runtime does not model, so
+  its likeliest weather stands in.
+
+Effect Lighting rather than Sunlight: the inn's window shader has a white tint and a neutral grey
+glow map, so the warm colour of Skyrim's lit windows at night can only come from the source. Both
+colours are black by day for the window regions.
+
+A target that is missing, deleted, not a `LIGH` or `REGN`, or whose weather has no Effect Lighting
+colour gets no row and a warning; the runtime then keeps the model's own emission. The movement
+annotator's subset export does not touch this table.
+
+Measured on Skyrim SE with its official plugins: 9,655 references carry `XEMI`, naming 211
+sources. 166 lights and 31 regions resolve; 14 regions list no weather at all (the largest,
+`RiverwoodMountainsSnow` `0002E2CC`, is named by 479 references), and what Skyrim lends from such
+a region is unverified, so their 651 references keep the model's emission.
+
+```sql
+CREATE TABLE IF NOT EXISTS emittance (
+    id INTEGER PRIMARY KEY,        -- XEMI target: a LIGH or REGN FormID
+    source_type TEXT NOT NULL,     -- 'LIGH' or 'REGN'
+    weather_id INTEGER,            -- REGN: the WTHR its colours come from
+    sunrise_r INTEGER NOT NULL, sunrise_g INTEGER NOT NULL, sunrise_b INTEGER NOT NULL,
+    day_r INTEGER NOT NULL, day_g INTEGER NOT NULL, day_b INTEGER NOT NULL,
+    sunset_r INTEGER NOT NULL, sunset_g INTEGER NOT NULL, sunset_b INTEGER NOT NULL,
+    night_r INTEGER NOT NULL, night_g INTEGER NOT NULL, night_b INTEGER NOT NULL
+);
+```
+
+The engine reads the day columns, its one time of day; see
+[`color-pipeline.md`](../engine/color-pipeline.md#external-emittance-242).

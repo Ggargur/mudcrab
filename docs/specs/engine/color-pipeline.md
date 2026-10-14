@@ -39,7 +39,7 @@ The previous non-HDR mesh path tone-mapped in each material shader. The custom s
 
 - V9: NIF glossiness exponent → bounded monotonic `(2 / (n + 2))^0.25` perceptual roughness; GGX lobe approximation, not exact Skyrim BRDF.
 - V10: Specular flag off or strength zero → explicit zero glTF factor. Enabled tangent normals → shared linear normal-alpha mask; model-space normals excluded. glTF specular factor ∈ [0,1]; only tagged loaded masks receive Bevy 0.19 compensation; generic glTF unchanged. F0 still squares scalar/mask inputs; native Skyrim intensity/BRDF parity remains gap.
-- V11: Pruning/remapping ! both specular extension textures; removed mask → unchanged bounded factor and no native compensation. Current producer 24 combines native BC textures, emission/specular and source-surface fixes. Rebuild all legacy GLB/KTX2/world outputs from schemas 12–23; retain only source/configuration/output-verified scripts/archive ingestion. Exact producer 24 required for staged meshes/textures; encoder mode and GPU quality participate in configuration identity. Runtime/launcher accept complete converter schemas 15–24 and world schemas 3–7. Schema 5 grass worlds need no LOD tables.
+- V11: Pruning/remapping ! both specular extension textures; removed mask → unchanged bounded factor and no native compensation. Current producer 24 combines native BC textures, emission/specular and source-surface fixes. Rebuild all legacy GLB/KTX2/world outputs from schemas 12–23; retain only source/configuration/output-verified scripts/archive ingestion. Exact producer 24 required for staged meshes/textures; encoder mode and GPU quality participate in configuration identity. Runtime/launcher accept complete converter schemas 15–24 and world schemas 3–8. Schema 5 grass worlds need no LOD tables.
 - V12: Scene-only glTF loads ! reach and retain recursively loaded state after unused subassets release. Native material override retains stock hook's recorded source dependency; scene cloning preserves source and native handles. Probe ! no root-glTF or explicit material loads that mask dependency lifetime failures.
 
 - V13: Converted tangent-space NIF normals ! DirectX Y convention exactly once at native material construction; generic glTF/model-space maps unchanged. Preserve linear RGB & source alpha. ±X/±Y/asymmetric GPU swatches ! match independent geometric normals ≤2/255; legacy no-flip control ! fail.
@@ -80,11 +80,46 @@ Signed NIF tints remain valid. Negative channels retain previous glTF lower-clam
 
 `material_emission_probe --output <dir> [--interior] [--legacy-emission]`: converter-published synthetic NIF contracts → glTF/KTX2 → Bevy loader → GPU swatches. Nine cases: zero, dim, unit, HDR, dim HDR, black glow, untextured HDR, Own_Emit atlas, signed tint. Loaded factors checked against authored energy; glow view ! `Rgba8UnormSrgb`. Converted swatches compared with independently computed material RGB at tolerance 2/255; zero cases ! black, other references ! visible. 800×900, orthographic camera `(0,0,10)`, no lights/ambient/fog/dither/MSAA, pinned scene tone map/exposure. Interior/exterior here change diagnostic background only; no authored scene parity claim. Synthetic contract publication ≠ full NIF-file parse coverage. `--legacy-emission` restores old energy/eligibility defects inside probe and ! fail with exit 1. Every run records PNG, JSON, generated glTF/KTX2; removes stale verdicts before startup.
 
-Historical emission migration (schema 17): schemas 12–16 retain verified non-GLB entries/archive ingestion only when source and original configuration hash match; GLBs/world data rebuilt. Configuration changes still invalidate cache. Stage journal schema check rejects old staged GLBs. Current runtime/launcher accept complete converter schemas 15–24 and world database schemas 3–7; cell-cache version unchanged.
+Historical emission migration (schema 17): schemas 12–16 retain verified non-GLB entries/archive ingestion only when source and original configuration hash match; GLBs/world data rebuilt. Configuration changes still invalidate cache. Stage journal schema check rejects old staged GLBs. Current runtime/launcher accept complete converter schemas 15–24 and world database schemas 3–8; cell-cache version unchanged.
 
 For testing, reconvert to separate output directory with converter built from this branch, then run matching engine against that directory. Existing packs remain valid in engine but retain old emission until reconverted. Preserve old pack for rollback; older #137 engine rejects schema 17, so use new engine for new pack. Retail reconversion ! isolated matching package; delivery evidence recorded after successful conversion/startup.
 
 Verification: `v6_emission_preserves_zero_dim_hdr_and_black_glow_energy`, `v6_own_emit_does_not_enable_slot_two_glow`, `v6_rejects_overflowing_emission_with_context`, `v8_signed_tint_keeps_source_and_clamps_only_gltf_negative_channels`, `recent_schema_migrations_reuse_only_unchanged_asset_kinds`, `v15_old_material_schemas_rebuild_meshes_and_reuse_compatible_assets`; engine runtime-schema acceptance tests; both probe backgrounds plus legacy negative control. Full converter/engine library suites, formatting and Clippy required before publication.
+
+## External emittance (#242)
+
+`SLSF1_External_Emittance` (bit 29) says a surface's emission colour comes from outside the model:
+from the light or region its reference names in `XEMI`. Building windows use it. The Sleeping
+Giant Inn's window (`architecture\farmhouse\inn01.nif`, shape `Inn01:14`) is a Glow shader with a
+white tint, multiplier 3 and a neutral grey glow map; its Riverwood reference names
+`FXLightRegionInvertWindowWhiterun`, whose weather's Effect Lighting colour is black by day and
+amber at night. Publishing the static emission alone left the windows lit in daylight.
+
+The GLB keeps the flag in `extras.openSkyrim.shaderFlags1`, so no mesh is reconverted. The
+converter resolves each `XEMI` source's colour at every time of day into the `emittance` table
+([db-schema §15](../converters/db-schema.md#15-reference-emittance-sources-emittance), world
+schema 8). At runtime:
+
+- `NifMaterialPlugin` marks each primitive whose material has bit 29 with `ExternalEmittance`,
+  carried with the scene into every instance.
+- A reference whose source resolved gets `ReferenceEmittance`: the day colour (the engine's one
+  time of day, `sky.rs`) decoded from 8-bit sRGB to linear, as light colours are.
+- When the model is instantiated below the reference, each marked surface draws with a material
+  whose emission is the model's own emission times that colour. Materials are shared per model
+  material and colour, and the model's material stays unchanged for other references.
+
+Approximations: the colour multiplies the published emission instead of replacing the NIF tint,
+because the glTF cannot separate tint from multiplier; the two agree for the white-tinted window
+shaders. A region's likeliest weather stands in for its climate. A surface whose reference names
+no source, or one the converter could not resolve, keeps the model's emission; Skyrim's behaviour
+there is unverified. A database older than schema 8 has no sources and keeps the previous
+always-lit result until reconverted.
+
+Verification: `resolves_reference_emittance_from_regions_and_lights`,
+`the_sleeping_giant_inn_windows_are_dark_by_day` (opt-in, reads `Skyrim.esm`),
+`returns_the_day_colour_of_a_reference_emittance_source`,
+`external_emittance_needs_bit_29_of_shader_flags_1`,
+`a_black_day_colour_darkens_only_the_external_emittance_surface` and the other `emittance` tests.
 
 ## Local verification, 2026-10-02
 

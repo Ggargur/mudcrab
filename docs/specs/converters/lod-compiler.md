@@ -88,7 +88,8 @@ content hashes of inputs, rule set, settings, and compiler version
 publish only after every referenced payload validates. The `lod` reshape
 ships with a world DB version bump.
 
-The combined implementation uses converter schema 24 and world schema 7. World schema 5
+The combined implementation uses converter schema 24 and world schema 8 (schema 8 adds
+reference emittance, #242, so a schema 7 LOD package must be reconverted). World schema 5
 belongs to grass data; LOD tables were introduced in schema 6. Only verified current
 producer 24 meshes may be reused during normal conversion. Producer 23 was shared by
 the source-surface exporter before and after rigid-body dynamics changed the GLB payload;

@@ -408,10 +408,10 @@ async fn combined_export_keeps_grass_links_lod_origins_and_payloads() {
     let world_schema: u32 = db
         .query_row("SELECT version FROM schema_info", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(world_schema, 7);
+    assert_eq!(world_schema, 8);
     let manifest: serde_json::Value =
         serde_json::from_slice(&fs::read(output.join("lod-manifest.json")).unwrap()).unwrap();
     assert_eq!(manifest["converter_schema"], 24);
-    assert_eq!(manifest["world_database_schema"], 7);
+    assert_eq!(manifest["world_database_schema"], 8);
     assert_eq!(manifest["chunks"], report.lod_chunks);
 }

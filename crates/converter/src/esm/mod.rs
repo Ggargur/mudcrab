@@ -13,6 +13,7 @@ use std::{
 };
 pub mod binary;
 pub mod cell_cache;
+pub mod emittance;
 pub mod exporter;
 pub mod extractors;
 pub mod load_order;
@@ -338,14 +339,17 @@ fn is_form_id_subrecord(record_type: &[u8; 4], tag: &[u8], len: usize) -> bool {
     }
 }
 
-/// Where FormIDs sit inside a reference or cell subrecord that `is_form_id_subrecord`
+/// Where FormIDs sit inside a reference, cell or region subrecord that `is_form_id_subrecord`
 /// does not cover (it only matches single four-byte fields).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FormIdLayout {
     /// A fixed-size structure: each accepted byte length with its FormID offsets.
     Fixed(&'static [(usize, &'static [usize])]),
-    /// A packed array of `stride`-byte entries, each starting with a FormID.
-    Array { stride: usize },
+    /// A packed array of `stride`-byte entries, with a FormID at each of `form_ids` in every entry.
+    Array {
+        stride: usize,
+        form_ids: &'static [usize],
+    },
 }
 
 /// Field layouts per xEdit's TES5 definitions
@@ -383,7 +387,10 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         // Each activate parent is a separate subrecord: reference plus f32 delay.
         b"XAPR" if placed => Fixed(&[(8, &[0])]),
         // Location reference types.
-        b"XLRT" if placed => Array { stride: 4 },
+        b"XLRT" if placed => Array {
+            stride: 4,
+            form_ids: &[0],
+        },
         // A rider's horse.
         b"XHOR" if record_type == b"ACHR" => Fixed(SINGLE),
         // Lighting template, on cells and on worldspaces.
@@ -392,7 +399,15 @@ fn form_id_layout(record_type: &[u8; 4], tag: &[u8]) -> Option<FormIdLayout> {
         // from (`XCCM` names a REGN, not a climate).
         b"XCIM" | b"XCMO" | b"XCAS" | b"XCCM" if record_type == b"CELL" => Fixed(SINGLE),
         // Regions.
-        b"XCLR" if record_type == b"CELL" => Array { stride: 4 },
+        b"XCLR" if record_type == b"CELL" => Array {
+            stride: 4,
+            form_ids: &[0],
+        },
+        // A region's weathers: the weather, its chance, then an optional global.
+        b"RDWT" if record_type == b"REGN" => Array {
+            stride: 12,
+            form_ids: &[0, 8],
+        },
         _ => return None,
     })
 }
@@ -522,9 +537,12 @@ fn remap_record_form_ids(
                             data.len()
                         )
                     }),
-                FormIdLayout::Array { stride } => {
+                FormIdLayout::Array { stride, form_ids } => {
                     if data.len().is_multiple_of(stride) {
-                        Ok((0..data.len()).step_by(stride).collect())
+                        Ok((0..data.len())
+                            .step_by(stride)
+                            .flat_map(|entry| form_ids.iter().map(move |offset| entry + offset))
+                            .collect())
                     } else {
                         Err(format!(
                             "{name} length {} is not a multiple of {stride}",
@@ -706,6 +724,53 @@ mod tests {
             assert!(warnings.out_of_range.borrow().is_empty());
             assert!(warnings.truncations.borrow().is_empty());
         }
+    }
+
+    /// Each `RDWT` entry names a weather and, optionally, a global; its chance is not a FormID.
+    #[test]
+    fn remaps_region_weathers_and_their_globals() {
+        let indices = HashMap::from([("base.esm".into(), 0), ("patch.esp".into(), 2)]);
+        let entry = |weather: u32, chance: u32, global: u32| {
+            [
+                weather.to_le_bytes(),
+                chance.to_le_bytes(),
+                global.to_le_bytes(),
+            ]
+            .concat()
+        };
+        let mut record = RawRecord {
+            form_id: 0x0100_0800,
+            record_type: *b"REGN",
+            flags: 0,
+            subrecords: vec![(
+                b"RDWT".to_vec(),
+                [
+                    entry(0x0000_0901, 60, 0),
+                    entry(0x0100_0902, 40, 0x0100_0903),
+                ]
+                .concat(),
+            )],
+            cell_form_id: None,
+            worldspace_form_id: None,
+            load_order: 0,
+        };
+        remap_record_form_ids(
+            &mut record,
+            "patch.esp",
+            &["base.esm".into()],
+            &indices,
+            &HashMap::new(),
+            &RemapWarnings::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            record.subrecords[0].1,
+            [
+                entry(0x0000_0901, 60, 0),
+                entry(0x0200_0902, 40, 0x0200_0903)
+            ]
+            .concat()
+        );
     }
 
     #[test]

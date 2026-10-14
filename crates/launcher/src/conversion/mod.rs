@@ -1005,7 +1005,7 @@ pub(crate) mod tests {
             );
         }
         set_schemas(&output, converter::cache::CONVERTER_SCHEMA_VERSION, 5);
-        write_integration_report(&output, true); // Says current world 7, actual DB is 5.
+        write_integration_report(&output, true); // Says the current world schema; the DB is 5.
         assert!(
             !output_is_complete(&output),
             "integration report must match actual schema"
@@ -1015,7 +1015,11 @@ pub(crate) mod tests {
             !output_is_complete(&output),
             "corrupt database cannot enable Play"
         );
-        set_schemas(&output, converter::cache::CONVERTER_SCHEMA_VERSION, 7);
+        set_schemas(
+            &output,
+            converter::cache::CONVERTER_SCHEMA_VERSION,
+            shared::WORLD_DATABASE_SCHEMA_VERSION,
+        );
         let identity = "a".repeat(64);
         let database = rusqlite::Connection::open(output.join("skyrim_world.db")).unwrap();
         database
