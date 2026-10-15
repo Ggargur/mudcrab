@@ -83,22 +83,53 @@ type ExternalEmittanceSurfaces<'world, 'state> = Query<
     With<ExternalEmittance>,
 >;
 
+/// Marks a reference with a surface whose model material had not loaded when its scene was
+/// instantiated, so [`apply_reference_emittance`] tries again once a material arrives.
+#[derive(Component)]
+struct AwaitingEmittanceMaterial;
+
+/// Emitting references to visit: a newly instantiated model, or one still waiting for a material.
+type EmittingReferences<'world, 'state> = Query<
+    'world,
+    'state,
+    (
+        Entity,
+        &'static ReferenceEmittance,
+        Ref<'static, Children>,
+        Has<AwaitingEmittanceMaterial>,
+    ),
+    Or<(Changed<Children>, With<AwaitingEmittanceMaterial>)>,
+>;
+
 /// Gives every `External_Emittance` surface of a newly instantiated model its reference's colour.
 ///
 /// A reference gains a child the moment Bevy writes its converted scene below it, so
-/// `Changed<Children>` on an emitting reference is the frame its surfaces exist.
+/// `Changed<Children>` on an emitting reference is the frame its surfaces exist. A model can be
+/// instantiated before its materials finish loading; a surface whose material is not there yet is
+/// left as it is and its reference waits, to be visited again when a material is added.
 fn apply_reference_emittance(
     mut commands: Commands,
-    references: Query<(Entity, &ReferenceEmittance), Changed<Children>>,
-    children: Query<&Children>,
+    references: EmittingReferences,
+    descendants: Query<&Children>,
     mut surfaces: ExternalEmittanceSurfaces,
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut cache: ResMut<EmittanceMaterials>,
+    mut material_events: MessageReader<AssetEvent<StandardMaterial>>,
 ) {
-    for (reference, emittance) in &references {
+    let material_arrived = material_events.read().any(|event| {
+        matches!(
+            event,
+            AssetEvent::Added { .. } | AssetEvent::LoadedWithDependencies { .. }
+        )
+    });
+    for (reference, emittance, children, awaiting) in &references {
+        if !children.is_changed() && !material_arrived {
+            continue;
+        }
+        let mut missing = false;
         let colour = emittance.0;
         let colour_key = [colour.red, colour.green, colour.blue].map(f32::to_bits);
-        for descendant in children.iter_descendants(reference) {
+        for descendant in descendants.iter_descendants(reference) {
             let Ok((surface, mut material, source)) = surfaces.get_mut(descendant) else {
                 continue;
             };
@@ -120,6 +151,7 @@ fn apply_reference_emittance(
                 Some(lit) => lit,
                 None => {
                     let Some(lit) = materials.get(&source).map(|base| lit_by(base, colour)) else {
+                        missing = true;
                         continue;
                     };
                     let lit = materials.add(lit);
@@ -130,6 +162,17 @@ fn apply_reference_emittance(
             if material.0 != lit {
                 material.0 = lit;
             }
+        }
+        match (missing, awaiting) {
+            (true, false) => {
+                commands.entity(reference).insert(AwaitingEmittanceMaterial);
+            }
+            (false, true) => {
+                commands
+                    .entity(reference)
+                    .remove::<AwaitingEmittanceMaterial>();
+            }
+            _ => {}
         }
     }
 }
@@ -266,6 +309,52 @@ mod tests {
         assert_eq!(handle(first), handle(second));
         assert_ne!(handle(first), handle(other));
         assert_ne!(handle(first), material);
+    }
+
+    /// A model instantiated before its material loaded keeps its emission until the material
+    /// arrives, then takes its reference's colour.
+    #[test]
+    fn a_surface_whose_material_loads_late_gets_the_colour_when_it_arrives() {
+        let mut app = app();
+        let late = app
+            .world()
+            .resource::<Assets<StandardMaterial>>()
+            .reserve_handle();
+        let (placed, window, _) = reference(&mut app, Some([0, 0, 0]), &late);
+        app.update();
+        assert_eq!(
+            app.world()
+                .get::<MeshMaterial3d<StandardMaterial>>(window)
+                .unwrap()
+                .0,
+            late,
+            "nothing to multiply yet"
+        );
+        assert!(
+            app.world()
+                .get::<AwaitingEmittanceMaterial>(placed)
+                .is_some()
+        );
+
+        app.world_mut()
+            .resource_mut::<Assets<StandardMaterial>>()
+            .insert(
+                &late,
+                StandardMaterial {
+                    emissive: LinearRgba::new(3.0, 3.0, 3.0, 1.0),
+                    ..default()
+                },
+            )
+            .unwrap();
+        for _ in 0..3 {
+            app.update();
+        }
+        assert_eq!(emissive(&app, window), LinearRgba::new(0.0, 0.0, 0.0, 1.0));
+        assert!(
+            app.world()
+                .get::<AwaitingEmittanceMaterial>(placed)
+                .is_none()
+        );
     }
 
     /// A cell unloading despawns its references. The material derived for their surfaces is freed
