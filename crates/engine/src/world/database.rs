@@ -54,7 +54,7 @@ pub struct ReferenceRow {
     /// The 8-bit sRGB colour the reference's `XEMI` light or region lends its model's
     /// `External_Emittance` surfaces by day, the engine's one time of day (see `sky.rs`). `None`
     /// when the reference names no source the converter could resolve, and in a database
-    /// converted before world database schema 8.
+    /// converted before the `emittance` table existed.
     pub emittance: Option<[u8; 3]>,
 }
 
@@ -774,7 +774,7 @@ const ABSENT_RADIUS_OVERRIDE_COLUMN: &str = "NULL";
 const LIGHT_JOIN: &str = " LEFT JOIN lights l ON l.id=r.base_form_id";
 
 /// The day colour of the reference's `XEMI` source (`docs/specs/converters/db-schema.md`). The
-/// `emittance` table and `references.emittance_id` arrived in world database schema 8.
+/// `emittance` table and `references.emittance_id` are optional: an older database has neither.
 const EMITTANCE_COLUMNS: &str = "e.day_r,e.day_g,e.day_b";
 const ABSENT_EMITTANCE_COLUMNS: &str = "NULL,NULL,NULL";
 const EMITTANCE_JOIN: &str = " LEFT JOIN emittance e ON e.id=r.emittance_id";
@@ -1075,6 +1075,7 @@ mod tests {
         }
     }
 
+    /// Builds a database and conversion manifest with the current combined LOD identities.
     fn lod_build_contract_fixture(path: &Path, chunks: u32, identity: &str) {
         std::fs::write(
             path.parent().unwrap().join("conversion-manifest.json"),
@@ -1086,13 +1087,17 @@ mod tests {
         .unwrap();
         let connection = Connection::open(path).unwrap();
         connection
-            .execute_batch(&format!(
+            .execute_batch(
                 "CREATE TABLE schema_info(version INTEGER NOT NULL);
-                 INSERT INTO schema_info VALUES({});
                  CREATE TABLE lod_chunks(id INTEGER PRIMARY KEY);
                  CREATE TABLE lod_build(id INTEGER PRIMARY KEY,build_identity TEXT NOT NULL);",
-                shared::WORLD_DATABASE_SCHEMA_VERSION
-            ))
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO schema_info VALUES(?1)",
+                [shared::WORLD_DATABASE_SCHEMA_VERSION],
+            )
             .unwrap();
         for id in 0..chunks {
             connection
@@ -1129,12 +1134,13 @@ mod tests {
         }
     }
 
+    /// Current database schemas require LOD tables even when no LOD manifest is present.
     #[test]
     fn current_database_requires_lod_tables_even_without_manifest() {
         let directory = tempfile::tempdir().unwrap();
         let connection = Connection::open(directory.path().join("skyrim_world.db")).unwrap();
         connection
-            .execute("CREATE TABLE schema_info(version INTEGER NOT NULL)", [])
+            .execute_batch("CREATE TABLE schema_info(version INTEGER NOT NULL);")
             .unwrap();
         connection
             .execute(
@@ -1158,6 +1164,12 @@ mod tests {
                 shared::WORLD_DATABASE_SCHEMA_VERSION,
                 true,
             ),
+            (25, shared::WORLD_DATABASE_SCHEMA_VERSION, false),
+            (shared::LOD_CONVERTER_SCHEMA_VERSION, 8, false),
+            (25, 8, false),
+            (24, shared::WORLD_DATABASE_SCHEMA_VERSION, false),
+            (shared::LOD_CONVERTER_SCHEMA_VERSION, 7, false),
+            (24, 7, false),
             (24, 6, false),
             (23, 7, false),
             (22, 7, false),
@@ -1166,6 +1178,11 @@ mod tests {
             (19, 7, false),
             (16, 7, false),
         ] {
+            std::fs::write(
+                directory.path().join("conversion-manifest.json"),
+                serde_json::to_vec(&serde_json::json!({"schema_version": producer})).unwrap(),
+            )
+            .unwrap();
             Connection::open(&database)
                 .unwrap()
                 .execute("UPDATE schema_info SET version=?1", [world])
@@ -2024,7 +2041,7 @@ mod tests {
                 .references
                 .iter()
                 .all(|reference| reference.emittance.is_none()),
-            "a database from before schema 8 lends no emittance"
+            "a database without the emittance table lends no emittance"
         );
         assert_eq!(
             payload.references[0].model_path.as_deref(),
