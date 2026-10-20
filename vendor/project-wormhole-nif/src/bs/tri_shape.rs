@@ -1,5 +1,5 @@
 use project_wormhole_ba2::dev::Bounds;
-use project_wormhole_shared::glam::{U16Vec3, U8Vec4, Vec2, Vec3, Vec4};
+use project_wormhole_shared::glam::{Mat3, Mat4, U16Vec3, U8Vec4, Vec2, Vec3, Vec4};
 
 use super::prelude::*;
 
@@ -41,6 +41,40 @@ pub struct NiSkinInstance {
     pub skin_partition: u32,
     pub skeleton_root: u32,
     pub bones: Vec<u32>,
+    /// The body-part list a `BSDismemberSkinInstance` appends, one entry per
+    /// skin partition; `None` for a plain `NiSkinInstance`.
+    pub dismember_partitions: Option<Vec<DismemberPartition>>,
+}
+
+/// One `BSDismemberSkinInstance` body-part entry, matching a skin partition by position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DismemberPartition {
+    pub flags: u16,
+    pub body_part: u16,
+}
+
+impl NiSkinInstance {
+    /// Parses a `BSDismemberSkinInstance`: the `NiSkinInstance` fields followed
+    /// by a counted list of body-part entries.
+    pub fn parse_dismember(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        let (i, mut instance) = Self::parse(i)?;
+        let (mut i, partition_count) = le_u32(i)?;
+        if partition_count as usize > i.len() / 4 {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Count,
+            )));
+        }
+        let mut partitions = Vec::with_capacity(partition_count as usize);
+        for _ in 0..partition_count {
+            let (next, flags) = le_u16(i)?;
+            let (next, body_part) = le_u16(next)?;
+            i = next;
+            partitions.push(DismemberPartition { flags, body_part });
+        }
+        instance.dismember_partitions = Some(partitions);
+        Ok((i, instance))
+    }
 }
 
 impl Parse<&[u8]> for NiSkinInstance {
@@ -68,6 +102,7 @@ impl Parse<&[u8]> for NiSkinInstance {
                 skin_partition,
                 skeleton_root,
                 bones,
+                dismember_partitions: None,
             },
         ))
     }
@@ -77,6 +112,27 @@ impl Parse<&[u8]> for NiSkinInstance {
 pub struct NiSkinPartition {
     pub vertex_desc: BSVertexDesc,
     pub vertex_data: Vec<BSVertexData>,
+    /// Every partition's triangle copy, concatenated, indexing `vertex_data`.
+    pub triangles: Vec<U16Vec3>,
+    /// Each partition's bone palette and per-vertex influences. Filled by the
+    /// SSE layout only; `parse_legacy` leaves it empty.
+    pub partitions: Vec<SkinPartitionPart>,
+}
+
+/// One SSE skin partition. Per nif.xml, `bone_indices` index this partition's
+/// `bones` palette, which in turn indexes the skin instance's bone list; the
+/// weight and bone-index rows follow `vertex_map`, which indexes the shared
+/// vertex buffer.
+#[derive(Debug, Clone, Default)]
+pub struct SkinPartitionPart {
+    pub weights_per_vertex: u16,
+    pub bones: Vec<u16>,
+    pub vertex_map: Vec<u16>,
+    /// `vertex_map.len() * weights_per_vertex` weights, row per vertex.
+    pub vertex_weights: Vec<f32>,
+    /// `vertex_map.len() * weights_per_vertex` palette indices, row per vertex.
+    pub bone_indices: Vec<u8>,
+    /// The partition's triangle copy, indexing the shared vertex buffer.
     pub triangles: Vec<U16Vec3>,
 }
 
@@ -157,6 +213,7 @@ impl NiSkinPartition {
                 vertex_desc,
                 vertex_data: Vec::new(),
                 triangles,
+                partitions: Vec::new(),
             },
         ))
     }
@@ -189,28 +246,26 @@ impl Parse<&[u8]> for NiSkinPartition {
         }
 
         let mut triangles = Vec::new();
+        let mut partitions = Vec::new();
         for _ in 0..partition_count {
             let (next, num_vertices) = le_u16(i)?;
             let (next, num_triangles) = le_u16(next)?;
             let (next, num_bones) = le_u16(next)?;
             let (next, num_strips) = le_u16(next)?;
-            let (mut next, weights_per_vertex) = le_u16(next)?;
-            for _ in 0..num_bones {
-                (next, _) = le_u16(next)?;
-            }
+            let (next, weights_per_vertex) = le_u16(next)?;
+            let influences = usize::from(num_vertices) * usize::from(weights_per_vertex);
+            let (mut next, bones) = count(le_u16, usize::from(num_bones))(next)?;
             let (after_flag, has_vertex_map) = le_u8(next)?;
             next = after_flag;
+            let mut vertex_map = Vec::new();
             if has_vertex_map != 0 {
-                for _ in 0..num_vertices {
-                    (next, _) = le_u16(next)?;
-                }
+                (next, vertex_map) = count(le_u16, usize::from(num_vertices))(next)?;
             }
             let (after_flag, has_weights) = le_u8(next)?;
             next = after_flag;
+            let mut vertex_weights = Vec::new();
             if has_weights != 0 {
-                for _ in 0..usize::from(num_vertices) * usize::from(weights_per_vertex) {
-                    (next, _) = le_f32(next)?;
-                }
+                (next, vertex_weights) = count(le_f32, influences)(next)?;
             }
             let mut strip_lengths = Vec::with_capacity(num_strips as usize);
             for _ in 0..num_strips {
@@ -235,18 +290,25 @@ impl Parse<&[u8]> for NiSkinPartition {
             }
             let (after_flag, has_bone_indices) = le_u8(next)?;
             next = after_flag;
+            let mut bone_indices = Vec::new();
             if has_bone_indices != 0 {
-                let bytes = usize::from(num_vertices) * usize::from(weights_per_vertex);
-                (next, _) = take(bytes)(next)?;
+                let (rest, raw) = take(influences)(next)?;
+                next = rest;
+                bone_indices = raw.to_vec();
             }
             (next, _) = le_u8(next)?; // LOD level
             (next, _) = le_u8(next)?; // global vertex buffer
             (next, _) = BSVertexDesc::parse(next)?;
-            for _ in 0..num_triangles {
-                let (rest, triangle) = parse_u16_vec3(next)?;
-                next = rest;
-                triangles.push(triangle);
-            }
+            let (next, part_triangles) = count(parse_u16_vec3, usize::from(num_triangles))(next)?;
+            triangles.extend_from_slice(&part_triangles);
+            partitions.push(SkinPartitionPart {
+                weights_per_vertex,
+                bones,
+                vertex_map,
+                vertex_weights,
+                bone_indices,
+                triangles: part_triangles,
+            });
             i = next;
         }
         Ok((
@@ -255,6 +317,114 @@ impl Parse<&[u8]> for NiSkinPartition {
                 vertex_desc,
                 vertex_data,
                 triangles,
+                partitions,
+            },
+        ))
+    }
+}
+
+/// A NIF `NiTransform`: rotation, then translation, then uniform scale.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NiTransform {
+    pub rotation: Mat3,
+    pub translation: Vec3,
+    pub scale: f32,
+}
+
+impl NiTransform {
+    /// The affine matrix that scales, then rotates, then translates, the same
+    /// composition the static scene uses for a node's `NiAVObject` transform.
+    pub fn to_mat4(&self) -> Mat4 {
+        Mat4::from_translation(self.translation)
+            * Mat4::from_mat3(self.rotation)
+            * Mat4::from_scale(Vec3::splat(self.scale))
+    }
+}
+
+impl Parse<&[u8]> for NiTransform {
+    /// Reads the rotation with the same row-major convention as `NiAVObject` rotations.
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        let (i, rotation) = parse_mat3(i)?;
+        let (i, translation) = parse_vec3(i)?;
+        let (i, scale) = le_f32(i)?;
+        Ok((
+            i,
+            Self {
+                rotation,
+                translation,
+                scale,
+            },
+        ))
+    }
+}
+
+/// `NiSkinData` for NIF 20.2.0.7: the skin's overall transform and, per bone
+/// in the skin instance's bone order, its transform, bounds and optional
+/// per-vertex weights.
+#[derive(Debug, Clone)]
+pub struct NiSkinData {
+    pub skin_transform: NiTransform,
+    pub has_vertex_weights: bool,
+    pub bones: Vec<SkinBoneData>,
+}
+
+/// One `NiSkinData` bone entry.
+#[derive(Debug, Clone)]
+pub struct SkinBoneData {
+    pub transform: NiTransform,
+    pub bound_center: Vec3,
+    pub bound_radius: f32,
+    /// `(vertex index, weight)` pairs; empty unless the skin data has vertex weights.
+    pub vertex_weights: Vec<(u16, f32)>,
+}
+
+/// The fewest bytes one bone entry can take: a transform, a bounding sphere and a vertex count.
+const SKIN_BONE_DATA_MIN_BYTES: usize = 13 * 4 + 4 * 4 + 2;
+
+impl Parse<&[u8]> for NiSkinData {
+    /// Parses the skin transform and bone list, rejecting a bone count the remaining bytes cannot hold.
+    fn parse(i: &[u8]) -> IResult<&[u8], Self, nom::error::Error<&[u8]>> {
+        let (i, skin_transform) = NiTransform::parse(i)?;
+        let (i, bone_count) = le_u32(i)?;
+        let (mut i, has_vertex_weights) = le_u8(i)?;
+        if bone_count as usize > i.len() / SKIN_BONE_DATA_MIN_BYTES {
+            return Err(nom::Err::Failure(nom::error::Error::new(
+                i,
+                nom::error::ErrorKind::Count,
+            )));
+        }
+        let has_vertex_weights = has_vertex_weights != 0;
+        let mut bones = Vec::with_capacity(bone_count as usize);
+        for _ in 0..bone_count {
+            let (next, transform) = NiTransform::parse(i)?;
+            let (next, bound_center) = parse_vec3(next)?;
+            let (next, bound_radius) = le_f32(next)?;
+            let (mut next, vertex_count) = le_u16(next)?;
+            let mut vertex_weights = Vec::new();
+            if has_vertex_weights {
+                (next, vertex_weights) = count(
+                    |i| -> IResult<&[u8], (u16, f32)> {
+                        let (i, vertex) = le_u16(i)?;
+                        let (i, weight) = le_f32(i)?;
+                        Ok((i, (vertex, weight)))
+                    },
+                    usize::from(vertex_count),
+                )(next)?;
+            }
+            i = next;
+            bones.push(SkinBoneData {
+                transform,
+                bound_center,
+                bound_radius,
+                vertex_weights,
+            });
+        }
+        Ok((
+            i,
+            Self {
+                skin_transform,
+                has_vertex_weights,
+                bones,
             },
         ))
     }

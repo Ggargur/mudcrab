@@ -109,6 +109,7 @@ pub enum NifBlock {
     NiPoint3Interpolator(NiPoint3Interpolator),
     NiPointLight(NiPointLight),
     NiPosData(NiPosData),
+    NiSkinData(NiSkinData),
     NiSkinInstance(NiSkinInstance),
     NiSkinPartition(NiSkinPartition),
     NiStringExtraData(NiStringExtraData),
@@ -254,6 +255,10 @@ impl std::fmt::Debug for NifBlock {
             NifBlock::NiPoint3Interpolator(_) => write!(f, "NiPoint3Interpolator"),
             NifBlock::NiPointLight(_) => write!(f, "NiPointLight"),
             NifBlock::NiPosData(_) => write!(f, "NiPosData"),
+            NifBlock::NiSkinData(_) => write!(f, "NiSkinData"),
+            NifBlock::NiSkinInstance(instance) if instance.dismember_partitions.is_some() => {
+                write!(f, "BSDismemberSkinInstance")
+            }
             NifBlock::NiSkinInstance(_) => write!(f, "NiSkinInstance"),
             NifBlock::NiSkinPartition(_) => write!(f, "NiSkinPartition"),
             NifBlock::NiStringExtraData(_) => write!(f, "NiStringExtraData"),
@@ -391,9 +396,19 @@ impl NifBlock {
                 Ok((i, NifBlock::BSMultiBoundOBB(result)))
             }
 
-            "NiSkinInstance" | "BSDismemberSkinInstance" => {
+            "NiSkinInstance" => {
                 let (i, result) = NiSkinInstance::parse(i)?;
                 Ok((i, NifBlock::NiSkinInstance(result)))
+            }
+
+            "BSDismemberSkinInstance" => {
+                let (i, result) = NiSkinInstance::parse_dismember(i)?;
+                Ok((i, NifBlock::NiSkinInstance(result)))
+            }
+
+            "NiSkinData" => {
+                let (i, result) = NiSkinData::parse(i)?;
+                Ok((i, NifBlock::NiSkinData(result)))
             }
 
             "NiSkinPartition" => {

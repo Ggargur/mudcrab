@@ -231,6 +231,12 @@ impl MeshConverter {
         open_nif_resilient(path).map(|(_, diagnostics, _)| diagnostics)
     }
 
+    /// Loads a NIF the way conversion does, with blocks that fail to parse
+    /// kept as `Unhandled` and counted in the diagnostics, for read-only tools.
+    pub fn open_nif(path: &Path) -> Result<(NifFile, NifParseDiagnostics)> {
+        open_nif_resilient(path).map(|(nif, diagnostics, _)| (nif, diagnostics))
+    }
+
     /// Loads a NIF and reports whether its declared geometry consists only of empty overlay templates.
     pub fn is_geometry_template(path: &Path) -> Result<bool> {
         open_nif_resilient(path).map(|(nif, _, _)| is_geometry_template(&nif))

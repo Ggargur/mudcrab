@@ -11,6 +11,8 @@ pub struct NiTriShape {
     pub rotation: Mat3,
     pub scale: f32,
     pub data: u32,
+    /// The `NiSkinInstance` link; `u32::MAX` when the shape has no skin.
+    pub skin_instance: u32,
     pub shader_property: u32,
     pub alpha_property: u32,
 }
@@ -32,7 +34,7 @@ impl Parse<&[u8]> for NiTriShape {
         let (i, scale) = le_f32(i)?;
         let (i, _) = le_u32(i)?;
         let (i, data) = le_u32(i)?;
-        let (i, _) = le_u32(i)?;
+        let (i, skin_instance) = le_u32(i)?;
         let (mut i, material_count) = le_u32(i)?;
         if material_count as usize > i.len() / 8 {
             return invalid(i);
@@ -53,6 +55,7 @@ impl Parse<&[u8]> for NiTriShape {
                 rotation: Mat3::from_cols_array(&rotation),
                 scale,
                 data,
+                skin_instance,
                 shader_property,
                 alpha_property,
             },
