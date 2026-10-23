@@ -170,10 +170,12 @@ pub(crate) fn conversion_is_complete(report: &PipelineReport) -> bool {
 
 /// One line per projection omission category (#297): a lost light row warns, so the run is
 /// incomplete; an unresolved emittance target keeps the model's emission and is only noted.
+/// Returns whether a row was lost, so the caller can withdraw the persisted record proof.
+#[must_use]
 pub(crate) fn report_projection_omissions(
     report: &mut PipelineReport,
     omissions: &crate::esm::projection_omissions::ProjectionOmissions,
-) {
+) -> bool {
     use crate::esm::projection_omissions::{Severity, summary_line};
     for (category, outcome) in &omissions.categories {
         let message = format!(
@@ -185,6 +187,7 @@ pub(crate) fn report_projection_omissions(
             Severity::Fallback => report.notices.push(message),
         }
     }
+    omissions.has_data_loss()
 }
 
 /// A run's stop button. The command line sets it when the user interrupts (Ctrl+C); the pipeline
@@ -1529,7 +1532,11 @@ impl AssetPipeline {
                     integration.cache_cells,
                 ));
             }
-            report_projection_omissions(&mut report, &integration.projection_omissions);
+            // Fresh and restored databases both reach here, after `record_data_complete` was
+            // set from the reader warnings alone; a lost light row withdraws that proof.
+            if report_projection_omissions(&mut report, &integration.projection_omissions) {
+                manifest.record_data_complete = Some(false);
+            }
             report.integration = Some(integration);
             report
                 .artifacts
@@ -7445,7 +7452,7 @@ mod tests {
         let mut fallback_only = ProjectionOmissions::default();
         fallback_only.record(OmissionCategory::EmittanceTargetAbsent, 0xDEAD, "absent");
         let mut report = PipelineReport::default();
-        report_projection_omissions(&mut report, &fallback_only);
+        assert!(!report_projection_omissions(&mut report, &fallback_only));
         assert!(report.warnings.is_empty());
         assert_eq!(report.notices.len(), 1);
         assert!(
@@ -7459,7 +7466,7 @@ mod tests {
         with_loss.record(OmissionCategory::LightShortData, 0x802, "short");
         with_loss.record(OmissionCategory::LightShortData, 0x803, "short");
         let mut report = PipelineReport::default();
-        report_projection_omissions(&mut report, &with_loss);
+        assert!(report_projection_omissions(&mut report, &with_loss));
         assert_eq!(report.notices.len(), 1);
         assert_eq!(report.warnings.len(), 1);
         assert!(

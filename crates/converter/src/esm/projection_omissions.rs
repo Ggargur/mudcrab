@@ -44,6 +44,23 @@ pub enum OmissionCategory {
 }
 
 impl OmissionCategory {
+    const ALL: [Self; 7] = [
+        Self::LightMissingData,
+        Self::LightShortData,
+        Self::EmittanceTargetAbsent,
+        Self::EmittanceLightUnusableData,
+        Self::EmittanceRegionNoWeather,
+        Self::EmittanceWeatherNoLighting,
+        Self::EmittanceTargetWrongType,
+    ];
+
+    /// The category stored under `name`, if this build knows it.
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|category| category.name() == name)
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::LightMissingData => "light_missing_data",
@@ -85,14 +102,6 @@ impl Severity {
         match self {
             Self::DataLoss => "data_loss",
             Self::Fallback => "fallback",
-        }
-    }
-
-    /// A severity this build does not know is treated as data loss, so it cannot pass silently.
-    fn parse(name: &str) -> Self {
-        match name {
-            "fallback" => Self::Fallback,
-            _ => Self::DataLoss,
         }
     }
 }
@@ -156,6 +165,13 @@ impl ProjectionOmissions {
         self.categories.is_empty()
     }
 
+    /// Whether any category lost rows, which makes the conversion's record data incomplete.
+    pub fn has_data_loss(&self) -> bool {
+        self.categories
+            .values()
+            .any(|omissions| omissions.severity == Severity::DataLoss)
+    }
+
     /// Replaces the stored omissions with these.
     pub fn write(&self, conn: &Connection) -> Result<()> {
         clear(conn)?;
@@ -175,6 +191,9 @@ impl ProjectionOmissions {
     }
 
     /// Reads the omissions of the last full export; empty when the tables are absent.
+    ///
+    /// Severity comes from this build's category, not the stored column: a category this build
+    /// does not know reads as data loss, so it cannot pass as success.
     pub fn read(conn: &Connection) -> Result<Self> {
         let present: Option<i64> = conn
             .query_row(
@@ -188,20 +207,18 @@ impl ProjectionOmissions {
             return Ok(omissions);
         }
         let mut statement =
-            conn.prepare("SELECT category, severity, count FROM projection_omission_stats")?;
+            conn.prepare("SELECT category, count FROM projection_omission_stats")?;
         let rows = statement.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)? as u64,
-            ))
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)? as u64))
         })?;
         for row in rows {
-            let (category, severity, count) = row?;
+            let (category, count) = row?;
+            let severity = OmissionCategory::from_name(&category)
+                .map_or(Severity::DataLoss, OmissionCategory::severity);
             omissions.categories.insert(
                 category,
                 CategoryOmissions {
-                    severity: Severity::parse(&severity),
+                    severity,
                     count,
                     samples: Vec::new(),
                 },
@@ -222,10 +239,15 @@ impl ProjectionOmissions {
         Ok(omissions)
     }
 
-    /// One terminal line per category, for a run without a report reader.
+    /// One terminal line per category, for a run without a report reader. Fallbacks print as
+    /// notes, as the conversion report files them as notices.
     pub fn print_summary(&self) {
         for (category, omissions) in &self.categories {
-            eprintln!("warning: {}", summary_line(category, omissions));
+            let prefix = match omissions.severity {
+                Severity::DataLoss => "warning",
+                Severity::Fallback => "note",
+            };
+            eprintln!("{prefix}: {}", summary_line(category, omissions));
         }
     }
 }
@@ -291,19 +313,31 @@ mod tests {
         assert!(ProjectionOmissions::read(&conn).unwrap().is_empty());
     }
 
+    /// Severity follows this build's category: an unknown category is data loss even when the
+    /// database stored it as a fallback, and a known one ignores a stale stored severity.
     #[test]
-    fn an_unknown_stored_severity_reads_as_data_loss() {
+    fn severity_comes_from_the_category_and_unknown_categories_are_data_loss() {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(PROJECTION_OMISSION_TABLES_SQL).unwrap();
-        conn.execute(
-            "INSERT INTO projection_omission_stats VALUES ('future_category', 'advisory', 2)",
-            [],
+        conn.execute_batch(
+            "INSERT INTO projection_omission_stats VALUES ('future_category', 'fallback', 2);
+             INSERT INTO projection_omission_stats VALUES ('emittance_target_absent', 'data_loss', 1);
+             INSERT INTO projection_omission_stats VALUES ('light_short_data', 'fallback', 1);",
         )
         .unwrap();
         let read = ProjectionOmissions::read(&conn).unwrap();
-        assert_eq!(
-            read.categories["future_category"].severity,
-            Severity::DataLoss
-        );
+        let severity = |category: &str| read.categories[category].severity;
+        assert_eq!(severity("future_category"), Severity::DataLoss);
+        assert_eq!(severity("emittance_target_absent"), Severity::Fallback);
+        assert_eq!(severity("light_short_data"), Severity::DataLoss);
+        assert!(read.has_data_loss());
+    }
+
+    #[test]
+    fn every_category_round_trips_through_its_name() {
+        for category in OmissionCategory::ALL {
+            assert_eq!(OmissionCategory::from_name(category.name()), Some(category));
+        }
+        assert_eq!(OmissionCategory::from_name("light"), None);
     }
 }

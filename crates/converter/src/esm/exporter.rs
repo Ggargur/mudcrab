@@ -957,12 +957,14 @@ fn export_records(
         crate::esm::rooms::export_room_graph(&tx, master, &interior_cells)?;
         insert_emittance_sources(&tx, master, &mut omissions)?;
         omissions.write(&tx)?;
-        omissions.print_summary();
         // Read back from the canonical `records` and `references` rows just written, so the
         // legacy and in-house readers share one projection.
         super::doors::project_door_links(&tx)?;
     }
-    tx.commit()
+    tx.commit()?;
+    // Every export prints what it left out, including the subset exports that store nothing.
+    omissions.print_summary();
+    Ok(())
 }
 
 /// Rebuilds `emittance`: one row per `XEMI` target in `references` that resolves to a colour.
@@ -983,13 +985,17 @@ fn insert_emittance_sources(
         .query_map([], |row| row.get(0))?
         .collect::<Result<_>>()?;
     for target in targets {
-        let Some(record) = master.get(&target).filter(|record| !record.is_deleted()) else {
-            omissions.record(
-                OmissionCategory::EmittanceTargetAbsent,
-                target,
-                "not in the load order; no emittance row",
-            );
-            continue;
+        let record = match master.get(&target) {
+            Some(record) if !record.is_deleted() => record,
+            found => {
+                let reason = if found.is_some() {
+                    "deleted in the load order; no emittance row"
+                } else {
+                    "not in the load order; no emittance row"
+                };
+                omissions.record(OmissionCategory::EmittanceTargetAbsent, target, reason);
+                continue;
+            }
         };
         let view = SubrecordView::new(&record.subrecords);
         let (source_type, weather, colours) = match &record.record_type {
@@ -2270,6 +2276,7 @@ mod tests {
             healthy.clone(),
             emitting_reference(0x1000, 0x700),
             emitting_reference(0x1001, 0xDEAD),
+            emitting_reference(0x1006, 0x620),
             emitting_reference(0x1002, 0x900),
             emitting_reference(0x1003, 0x600),
             emitting_reference(0x1004, 0x610),
@@ -2278,6 +2285,11 @@ mod tests {
             record(0x600, b"REGN", None, None, Vec::new()),
             region(0x610, &[(0x611, 100)]),
             record(0x611, b"WTHR", None, None, Vec::new()),
+            // Deleted by a later plugin: the record is there, the target is not.
+            RawRecord {
+                flags: 0x20,
+                ..record(0x620, b"STAT", None, None, Vec::new())
+            },
         ];
         records.extend(broken.iter().cloned());
         let master: HashMap<u32, RawRecord> = records
@@ -2304,7 +2316,7 @@ mod tests {
         let expected = vec![
             ("emittance_light_unusable_data".to_owned(), 1, vec![0x802]),
             ("emittance_region_no_weather".to_owned(), 1, vec![0x600]),
-            ("emittance_target_absent".to_owned(), 1, vec![0xDEAD]),
+            ("emittance_target_absent".to_owned(), 2, vec![0x620, 0xDEAD]),
             ("emittance_target_wrong_type".to_owned(), 1, vec![0x900]),
             ("emittance_weather_no_lighting".to_owned(), 1, vec![0x610]),
             ("light_missing_data".to_owned(), 1, vec![0x801]),
@@ -2325,6 +2337,18 @@ mod tests {
                 .reason
                 .contains("12 bytes"),
             "{stored:?}"
+        );
+        let absent: Vec<&str> = stored.categories["emittance_target_absent"]
+            .samples
+            .iter()
+            .map(|sample| sample.reason.as_str())
+            .collect();
+        assert_eq!(
+            absent,
+            vec![
+                "deleted in the load order; no emittance row",
+                "not in the load order; no emittance row",
+            ]
         );
 
         // Exporting the same load order again replaces the counts instead of adding to them.

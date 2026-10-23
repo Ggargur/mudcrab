@@ -666,7 +666,10 @@ async fn rebuild_into(
         "rebuilt asset integration failed: {:?}",
         integration.issues
     );
-    report_projection_omissions(&mut report, &integration.projection_omissions);
+    // The proof set from the fresh read above does not see projection omissions.
+    if report_projection_omissions(&mut report, &integration.projection_omissions) {
+        manifest.record_data_complete = Some(false);
+    }
     report.integration = Some(integration);
     report
         .artifacts

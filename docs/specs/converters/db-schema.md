@@ -1435,8 +1435,14 @@ CREATE TABLE IF NOT EXISTS projection_omission_samples ( -- the lowest FormIDs, 
 `data_loss` category adds one line to the conversion's `warnings` and makes the output
 incomplete. A reference whose emittance target does not resolve keeps the model's own emission
 (section 16), the documented fallback, so a `fallback` category adds one line to `notices` and the
-output stays complete. A severity the reader does not know is read as `data_loss`, so a category
-added by a newer converter cannot pass as success.
+output stays complete. The reader takes the severity from its own category list, not from the
+stored column: a category it does not know reads as `data_loss` whatever the column says, so a
+category added by a newer converter cannot pass as success. The terminal prints `data_loss`
+categories as `warning:` and `fallback` ones as `note:`, on every export.
+
+A `data_loss` category also withdraws the record proof the manifest persists: the conversion and
+the metadata rebuild set `record_data_complete` to `false`, and `repair-failed` never marks a pack
+complete while its database reports one, even when an older manifest claims complete records.
 
 A full load-order export clears and rewrites both tables inside its transaction, so a re-export
 replaces the counts instead of adding to them, and a repaired load order leaves the tables empty.
